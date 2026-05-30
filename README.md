@@ -20,16 +20,16 @@ This project implements a custom image processing pipeline for converting line-a
 
 ## Output Files
 
-| File | Dimensions | Contours | Beziers | Lines |
-|------|-----------|----------|---------|-------|
-| `1.svg` | 546x548 | 10 | 29 | 4 |
-| `2.svg` | 528x526 | 13 | 46 | 12 |
-| `3.svg` | 550x544 | 16 | 15 | 5 |
-| `4.svg` | 538x540 | 16 | 16 | 6 |
-| `5.svg` | 538x552 | 15 | 40 | 7 |
-| `6.svg` | 560x576 | 12 | 12 | 2 |
+| File | Dimensions | Contours |
+|------|-----------|----------|
+| `1.svg` | 546x548 | 5 |
+| `2.svg` | 528x526 | 7 |
+| `3.svg` | 550x544 | 8 |
+| `4.svg` | 538x540 | 8 |
+| `5.svg` | 538x552 | 8 |
+| `6.svg` | 560x576 | 6 |
 
-**Note:** Current implementation uses multi-scale Bezier fitting with sliding windows for longer curves. This produces recognizable shapes but may have control point issues that cause self-intersection in some curves. The algorithm uses RDP simplification (epsilon=2.0) followed by corner detection and adaptive curve fitting.
+**Note:** Current implementation uses Potrace (via pypotrace) for true Bezier curve tracing. Potrace produces optimal cubic Bezier curves with proper corner handling. `fill-rule="evenodd"` handles interior cutouts correctly.
 
 ## Pipeline Architecture
 
@@ -39,41 +39,31 @@ PNG Input
     ▼
 ┌─────────────────────────┐
 │ Phase 1: Pre-processing │
-│ • Load PNG with alpha    │
-│ • Bilateral filter       │  ← Edge-preserving smooth
-│ • Adaptive threshold     │  ← Handle varying stroke thickness
-│ • Morphological cleanup │
+│ • Load PNG with PIL     │
+│ • Binarize with         │  ← Threshold-based
+│   threshold             │
 └───────────┬─────────────┘
             │
             ▼
 ┌─────────────────────────┐
-│ Phase 2: Contour        │
-│   Extraction            │
-│ • OpenCV findContours   │  ← Hierarchy-aware
-│ • Area-based filtering  │
-│ • Hierarchy analysis    │
+│ Phase 2: Potrace        │
+│   Tracing               │
+│ • pypotrace.Bitmap     │  ← Creates bitmap from image
+│ • bmp.trace()          │  ← Potrace algorithm
+│ • Turdsize, turnpolicy │  ← Ambiguity resolution
 └───────────┬─────────────┘
             │
             ▼
 ┌─────────────────────────┐
-│ Phase 3: Curve          │
-│   Smoothing             │
-│ • RDP simplification    │  ← Reduce point count
-│ • Corner detection      │  ← Preserve sharp corners
-│ • Bezier fitting        │  ← Smooth curves
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Phase 4: SVG            │
+│ Phase 3: SVG            │
 │   Generation            │
-│ • Bezier to path data   │
-│ • Filled paths          │  ← Not stroked
-│ • SVG structure         │
+│ • Cubic Bezier (C)      │  ← Smooth curve segments
+│ • Line (L) for corners │  ← Sharp edge preservation
+│ • Fill-rule evenodd     │  ← Interior cutouts
 └───────────┬─────────────┘
             │
             ▼
-SVG Output (1.svg, 2.svg)
+SVG Output (1.svg - 6.svg)
 ```
 
 ## Key Technical Decisions
@@ -86,13 +76,13 @@ Standard Gaussian blur smooths everything, blurring edges. Bilateral filter pres
 
 Fixed threshold assumes uniform lighting. Adaptive threshold adjusts to local image characteristics, handling varying stroke thickness.
 
-### Why RDP + Bezier?
+### Why Potrace?
 
-Direct Bezier fitting on raw contours produces oscillation. RDP first simplifies to key points, then Bezier fitting produces smooth, stable curves.
+Potrace produces optimal cubic Bezier curves from bitmap images. It handles corner detection automatically (CornerSegment vs BezierSegment) and produces mathematically smooth curves with minimal control points.
 
-### Why Corner Detection?
+### Why Threshold-based Binarization?
 
-Without corner detection, all corners get smoothed into curves. Angle-based detection preserves intended sharp corners while smoothing gradual curves.
+Simple thresholding works well for clean line art. The threshold parameter allows tuning for different image types (dark strokes on light bg vs light strokes on dark bg).
 
 ## Usage
 
@@ -101,25 +91,24 @@ Without corner detection, all corners get smoothed into curves. Angle-based dete
 python3 png-to-smooth-svg.py 1.png 2.png 3.png 4.png 5.png 6.png
 
 # With custom parameters
-python3 png-to-smooth-svg.py --rdp-epsilon 0.5 --corner-angle 30 1.png
+python3 png-to-smooth-svg.py --threshold 100 --turdsize 5 --corner-threshold 0.8 1.png
 
-# Validate results
-python3 validate-results.py
+# With no background
+python3 png-to-smooth-svg.py --background-color none 1.png
 ```
 
 ## Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| bilateral_d | 9 | Pixel neighborhood diameter |
-| bilateral_sigma_color | 75 | Color space filter strength |
-| bilateral_sigma_space | 75 | Coordinate space filter strength |
-| adaptive_block_size | 11 | Adaptive threshold block size |
-| adaptive_c | 2 | Adaptive threshold constant |
-| rdp_epsilon | 0.5 | RDP simplification tolerance (lower = more detail) |
-| corner_angle | 30 | Minimum corner angle for detection (degrees) |
-| line_tolerance | 2.0 | Max distance from chord to be considered straight |
-| min_bezier_points | 4 | Minimum points for Bezier fitting |
+| threshold | 128 | Brightness cutoff (0-255) for binarization |
+| turnpolicy | minority | How to resolve ambiguities in path decomposition |
+| turdsize | 2 | Suppress speckles of up to this many pixels |
+| corner_threshold | 1.0 | Smaller values = sharper corners (alphamax) |
+| opttolerance | 0.2 | Curve optimization tolerance |
+| opticurve | true | Enable curve optimization |
+| foreground_color | #000000 | Foreground color after trace |
+| background_color | #ffffff | Background color after trace |
 
 ## File Structure
 

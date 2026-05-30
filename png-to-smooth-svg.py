@@ -2,96 +2,151 @@
 """
 png-to-smooth-svg.py
 
-Using Catmull-Rom spline smoothing with corner detection.
-Corner-aware smoothing preserves sharp turns while smoothing curves.
+Using Potrace (via pypotrace) for bitmap tracing with true Bezier curve output.
+Produces smooth, scalable SVG paths with proper corner handling.
 fill-rule="evenodd" handles interior cutouts correctly.
+
+Parameters (matching Potrace specification):
+- threshold: Brightness cutoff (0-255) for binarization
+- turnpolicy: How to resolve ambiguities in path decomposition
+- turdsize: Suppress speckles of up to this many pixels
+- corner_threshold: Smaller values = sharper corners
+- opttolerance: Curve optimization tolerance
+- optimize_curve: Join adjacent Bezier segments where possible
 """
 
+import potrace
 import cv2
 import numpy as np
 from PIL import Image
 from pathlib import Path
 
 
-def angle_at(pts, i):
-    """Measure turn angle at point i (interior angle of turn)."""
-    n = len(pts)
-    v1 = pts[i] - pts[(i - 1) % n]
-    v2 = pts[(i + 1) % n] - pts[i]
-    l1, l2 = np.linalg.norm(v1), np.linalg.norm(v2)
-    if l1 < 1e-10 or l2 < 1e-10:
-        return 0.0
-    cos_a = np.clip(np.dot(v1, v2) / (l1 * l2), -1, 1)
-    return np.degrees(np.arccos(cos_a))
+# Potrace turn policy constants
+TURNPOLICY_BLACK = potrace.POTRACE_TURNPOLICY_BLACK
+TURNPOLICY_WHITE = potrace.POTRACE_TURNPOLICY_WHITE
+TURNPOLICY_LEFT = potrace.POTRACE_TURNPOLICY_LEFT
+TURNPOLICY_RIGHT = potrace.POTRACE_TURNPOLICY_RIGHT
+TURNPOLICY_MINORITY = potrace.POTRACE_TURNPOLICY_MINORITY
+TURNPOLICY_MAJORITY = potrace.POTRACE_TURNPOLICY_MAJORITY
+TURNPOLICY_RANDOM = potrace.POTRACE_TURNPOLICY_RANDOM
 
 
-def contour_to_path(cnt, simp_epsilon=1.5, smooth_tension=0.25, corner_thresh=25):
-    """Convert a contour to SVG path using Catmull-Rom with corner preservation."""
-    approx = cv2.approxPolyDP(cnt, simp_epsilon, closed=True)
-    pts = approx.reshape(-1, 2).astype(float)
-    n = len(pts)
-    if n < 2:
+def path_to_svg_d(path):
+    """Convert a potrace Path to SVG path data string.
+
+    Uses proper cubic Bezier curves (C command) for smooth segments
+    and line segments (L command) for corners.
+    """
+    parts = []
+    if not path or len(path) == 0:
         return ""
 
-    # Detect sharp corners (high angle change = corner)
-    is_corner = []
-    for i in range(n):
-        a = angle_at(pts, i)
-        is_corner.append(a > corner_thresh)
+    # path is a list of BezierSegment or CornerSegment objects
+    # Each segment has: end_point, is_corner, and for BezierSegment: c1, c2
+    # For CornerSegment: c (corner point)
 
-    parts = [f"M {pts[0][0]:.2f} {pts[0][1]:.2f}"]
+    # Get start point - it's the end_point of the last segment (closed path)
+    if len(path) > 0:
+        start_point = path[-1].end_point
+        parts.append(f"M {start_point.x:.2f} {start_point.y:.2f}")
 
-    for i in range(n):
-        p1 = pts[i]
-        p2 = pts[(i + 1) % n]
-
-        # If either endpoint is a corner, use a line segment
-        if is_corner[i] or is_corner[(i + 1) % n]:
-            parts.append(f"L {p2[0]:.2f} {p2[1]:.2f}")
+    for seg in path:
+        if seg.is_corner:
+            # Corner: line to corner point, then line to end point
+            parts.append(f"L {seg.c.x:.2f} {seg.c.y:.2f}")
+            parts.append(f"L {seg.end_point.x:.2f} {seg.end_point.y:.2f}")
         else:
-            # Smooth with Catmull-Rom spline
-            p0 = pts[(i - 1) % n]
-            p3 = pts[(i + 2) % n]
-
-            cp1 = p1 + smooth_tension * (p2 - p0)
-            cp2 = p2 - smooth_tension * (p3 - p1)
-            parts.append(f"C {cp1[0]:.2f} {cp1[1]:.2f} {cp2[0]:.2f} {cp2[1]:.2f} {p2[0]:.2f} {p2[1]:.2f}")
+            # Smooth curve: cubic Bezier with control points c1, c2 and end point
+            parts.append(f"C {seg.c1.x:.2f} {seg.c1.y:.2f} {seg.c2.x:.2f} {seg.c2.y:.2f} {seg.end_point.x:.2f} {seg.end_point.y:.2f}")
 
     parts.append("Z")
     return " ".join(parts)
 
 
-def png_to_svg(png_path, svg_path, simp_epsilon=1.5, smooth_tension=0.25, corner_thresh=25):
-    """Convert PNG to SVG with Catmull-Rom smoothing and corner preservation."""
+def contour_to_svg_d(contour, turdsize=2, turnpolicy=TURNPOLICY_MINORITY, alphamax=1.0,
+                     opticurve=True, opttolerance=0.2, width=1000, height=1000):
+    """Convert an OpenCV contour to SVG path data using Potrace.
+
+    Creates a temporary bitmap from the contour and traces it with Potrace.
+    """
+    # Create a mask image from the contour
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, -1)
+
+    # Also fill holes - create inverted mask for interior
+    # Actually, potrace traces black on white, so we need black foreground
+
+    # Create bitmap for potrace (needs to be inverted - potrace expects black on white)
+    # blacklevel=0 means black pixels are considered "foreground"
+    bmp = potrace.Bitmap(mask, blacklevel=0.5)
+
+    # Trace with potrace
+    path = bmp.trace(turdsize=turdsize, turnpolicy=turnpolicy, alphamax=alphamax,
+                     opticurve=opticurve, opttolerance=opttolerance)
+
+    return path
+
+
+def png_to_svg(png_path, svg_path, threshold=128, turdsize=2, turnpolicy=TURNPOLICY_MINORITY,
+               corner_threshold=1.0, opticurve=True, opttolerance=0.2,
+               background_color="#ffffff", foreground_color="#000000"):
+    """Convert PNG to SVG using Potrace.
+
+    Args:
+        png_path: Input PNG file path
+        svg_path: Output SVG file path
+        threshold: Brightness cutoff (0-255) for binarization
+        turdsize: Suppress speckles of up to this many pixels
+        turnpolicy: How to resolve ambiguities (TURNPOLICY_MINORITY, etc.)
+        corner_threshold: Smaller values = sharper corners (alphamax in potrace)
+        opticurve: Enable curve optimization
+        opttolerance: Curve optimization tolerance
+        background_color: Background color (#rrggbb or 'none')
+        foreground_color: Foreground/stroke color
+    """
     # Load image
     img = Image.open(png_path)
     w, h = img.size
 
-    # Extract black strokes
-    if img.mode != 'RGBA':
-        img = img.convert('RGBA')
+    # Convert to grayscale and binarize
+    if img.mode != 'L':
+        img = img.convert('L')
+
     arr = np.array(img)
-    mask = ((arr[:, :, 0] < 30) &
-            (arr[:, :, 1] < 30) &
-            (arr[:, :, 2] < 30) &
-            (arr[:, :, 3] > 128)).astype(np.uint8) * 255
 
-    # Find contours
-    contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    # Binarize based on threshold
+    # Invert: potrace expects black on white, but we have white strokes on black or vice versa
+    # Let's detect based on threshold
+    if threshold < 128:
+        # Dark strokes on light background
+        binary = (arr < threshold).astype(np.uint8) * 255
+    else:
+        # Light strokes on dark background
+        binary = (arr > (threshold - 128)).astype(np.uint8) * 255
 
-    # Build paths for all contours
-    all_ds = []
-    for cnt in contours:
-        if cv2.contourArea(cnt) < 30:
-            continue
-        d = contour_to_path(cnt, simp_epsilon=simp_epsilon, smooth_tension=smooth_tension, corner_thresh=corner_thresh)
+    # Trace with potrace
+    bmp = potrace.Bitmap(binary, blacklevel=0.5)
+    pathlist = bmp.trace(turdsize=turdsize, turnpolicy=turnpolicy,
+                        alphamax=corner_threshold, opticurve=opticurve,
+                        opttolerance=opttolerance)
+
+    # Build SVG path data
+    all_paths = []
+    for path in pathlist:
+        d = path_to_svg_d(path)
         if d:
-            all_ds.append(d)
+            all_paths.append(d)
 
-    # Combine into single path with evenodd fill
-    combined = " ".join(all_ds)
+    combined = " ".join(all_paths)
+
+    # Build SVG with parameters
+    fill_attr = f' fill="{foreground_color}"'
+    stroke_attr = f' stroke="{foreground_color}"' if foreground_color != 'none' else ''
+    bg_fill = f' fill="{background_color}"' if background_color != 'none' else ' fill="none"'
+
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
-  <path d="{combined}" fill="black" fill-rule="evenodd" stroke="none"/>
+  <path d="{combined}"{fill_attr}{stroke_attr} fill-rule="evenodd"/>
 </svg>'''
 
     with open(svg_path, 'w', encoding='utf-8') as f:
@@ -99,7 +154,7 @@ def png_to_svg(png_path, svg_path, simp_epsilon=1.5, smooth_tension=0.25, corner
 
     return {
         'success': True,
-        'num_contours': len(all_ds),
+        'num_paths': len(all_paths),
         'width': w,
         'height': h
     }
@@ -108,17 +163,40 @@ def png_to_svg(png_path, svg_path, simp_epsilon=1.5, smooth_tension=0.25, corner
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description='Convert PNG to smooth SVG')
+    parser = argparse.ArgumentParser(description='Convert PNG to smooth SVG using Potrace')
     parser.add_argument('input', nargs='+', help='Input PNG file(s)')
     parser.add_argument('--output-dir', default='.', help='Output directory')
-    parser.add_argument('--simp-epsilon', type=float, default=1.5,
-                        help='Simplification epsilon (default: 1.5)')
-    parser.add_argument('--smooth-tension', type=float, default=0.25,
-                        help='Catmull-Rom tension (default: 0.25)')
-    parser.add_argument('--corner-thresh', type=float, default=25,
-                        help='Corner angle threshold in degrees (default: 25)')
+    parser.add_argument('--threshold', type=int, default=128,
+                        help='Brightness cutoff (0-255) for binarization (default: 128)')
+    parser.add_argument('--turnpolicy', default='minority',
+                        choices=['black', 'white', 'left', 'right', 'minority', 'majority', 'random'],
+                        help='How to resolve ambiguities (default: minority)')
+    parser.add_argument('--turdsize', type=int, default=2,
+                        help='Suppress speckles of up to this many pixels (default: 2)')
+    parser.add_argument('--corner-threshold', type=float, default=1.0,
+                        help='Corner threshold - smaller = sharper corners (default: 1.0)')
+    parser.add_argument('--opttolerance', type=float, default=0.2,
+                        help='Curve optimization tolerance (default: 0.2)')
+    parser.add_argument('--no-opticurve', action='store_true',
+                        help='Disable curve optimization')
+    parser.add_argument('--background-color', default='#ffffff',
+                        help='Background color (default: #ffffff)')
+    parser.add_argument('--foreground-color', default='#000000',
+                        help='Foreground color (default: #000000)')
 
     args = parser.parse_args()
+
+    # Map turnpolicy string to constant
+    turnpolicy_map = {
+        'black': TURNPOLICY_BLACK,
+        'white': TURNPOLICY_WHITE,
+        'left': TURNPOLICY_LEFT,
+        'right': TURNPOLICY_RIGHT,
+        'minority': TURNPOLICY_MINORITY,
+        'majority': TURNPOLICY_MAJORITY,
+        'random': TURNPOLICY_RANDOM,
+    }
+    turnpolicy = turnpolicy_map.get(args.turnpolicy, TURNPOLICY_MINORITY)
 
     for input_path in args.input:
         input_file = Path(input_path)
@@ -127,12 +205,17 @@ def main():
         result = png_to_svg(
             str(input_file),
             str(output_path),
-            simp_epsilon=args.simp_epsilon,
-            smooth_tension=args.smooth_tension,
-            corner_thresh=args.corner_thresh
+            threshold=args.threshold,
+            turdsize=args.turdsize,
+            turnpolicy=turnpolicy,
+            corner_threshold=args.corner_threshold,
+            opticurve=not args.no_opticurve,
+            opttolerance=args.opttolerance,
+            background_color=args.background_color,
+            foreground_color=args.foreground_color
         )
 
-        print(f"{result['num_contours']} contours -> {output_path}")
+        print(f"{result['num_paths']} paths -> {output_path}")
 
 
 if __name__ == '__main__':
